@@ -9,209 +9,36 @@
 #include <stdio.h>
 #include <assert.h>
 
-#include "machoman.h"
+#include "machoman/machoman.h"
+#include "patchfinder32/patchfinder32.h"
+
+enum {
+    INSN_SEARCH_MODE_THUMB = 0,
+    INSN_SEARCH_MODE_ARM32
+};
+
+enum {
+    INSN_SEARCH_DIRECTION_FWD = 0,
+    INSN_SEARCH_DIRECTION_BWD
+};
+
+#define OSSERIALIZER_SERIALIZE_SYMBOL_NAME  "__ZNK12OSSerializer9serializeEP11OSSerialize"
+#define OSSYMBOL_GETMETACLASS_SYMBOL_NAME   "__ZNK8OSSymbol12getMetaClassEv"
+#define BUFATTR_CPX_SYMBOL_NAME             "_bufattr_cpx"
+#define COPYIN_SYMBOL_NAME                  "_copyin"
+#define KERNEL_PMAP_SYMBOL_NAME             "_kernel_pmap"
+
+#define SLIDE(type, addr, slide)        (type)((type)addr + (type)slide)
+#define UNSLIDE(type, addr, slide)      (type)((type)addr - (type)slide)
+
+#define ADDR_MAP_TO_KCACHE(addr)        ({ uint32_t _tmp_addr =         ((addr) ? SLIDE(uint32_t, UNSLIDE(void*, addr, base), kbase) : 0); _tmp_addr; })
+#define ADDR_KCACHE_TO_MAP(addr)        ({ void *_tmp_addr =    (void *)((addr) ? SLIDE(uint64_t, UNSLIDE(uint32_t, addr, kbase), base) : 0); _tmp_addr; })
 
 void *base = NULL;
 uint32_t kbase = 0;
 
 struct mach_header *mh = NULL;
 struct symtab_command *symtab = NULL;
-
-/* patchfinder32 - credits to planetbeing (https://github.com/planetbeing/ios-jailbreak-patchfinder) */
-
-static uint32_t bit_range(uint32_t x, int start, int end)
-{
-    x = (x << (31 - start)) >> (31 - start);
-    x = (x >> end);
-    return x;
-}
-
-static uint32_t ror(uint32_t x, int places)
-{
-    return (x >> places) | (x << (32 - places));
-}
-
-static int thumb_expand_imm_c(uint16_t imm12)
-{
-    if(bit_range(imm12, 11, 10) == 0)
-    {
-        switch(bit_range(imm12, 9, 8))
-        {
-            case 0:
-                return bit_range(imm12, 7, 0);
-            case 1:
-                return (bit_range(imm12, 7, 0) << 16) | bit_range(imm12, 7, 0);
-            case 2:
-                return (bit_range(imm12, 7, 0) << 24) | (bit_range(imm12, 7, 0) << 8);
-            case 3:
-                return (bit_range(imm12, 7, 0) << 24) | (bit_range(imm12, 7, 0) << 16) | (bit_range(imm12, 7, 0) << 8) | bit_range(imm12, 7, 0);
-            default:
-                return 0;
-        }
-    } else
-    {
-        uint32_t unrotated_value = 0x80 | bit_range(imm12, 6, 0);
-        return ror(unrotated_value, bit_range(imm12, 11, 7));
-    }
-}
-
-static int insn_is_32bit(uint16_t* i)
-{
-    return (*i & 0xe000) == 0xe000 && (*i & 0x1800) != 0x0;
-}
-
-
-static int insn_is_add_reg(uint16_t* i)
-{
-    if((*i & 0xFE00) == 0x1800)
-        return 1;
-    else if((*i & 0xFF00) == 0x4400)
-        return 1;
-    else if((*i & 0xFFE0) == 0xEB00)
-        return 1;
-    else
-        return 0;
-}
-
-static int insn_add_reg_rd(uint16_t* i)
-{
-    if((*i & 0xFE00) == 0x1800)
-        return (*i & 7);
-    else if((*i & 0xFF00) == 0x4400)
-        return (*i & 7) | ((*i & 0x80) >> 4) ;
-    else if((*i & 0xFFE0) == 0xEB00)
-        return (*(i + 1) >> 8) & 0xF;
-    else
-        return 0;
-}
-
-static int insn_add_reg_rm(uint16_t* i)
-{
-    if((*i & 0xFE00) == 0x1800)
-        return (*i >> 6) & 7;
-    else if((*i & 0xFF00) == 0x4400)
-        return (*i >> 3) & 0xF;
-    else if((*i & 0xFFE0) == 0xEB00)
-        return *(i + 1) & 0xF;
-    else
-        return 0;
-}
-
-static int insn_is_mov_imm(uint16_t* i)
-{
-    if((*i & 0xF800) == 0x2000)
-        return 1;
-    else if((*i & 0xFBEF) == 0xF04F && (*(i + 1) & 0x8000) == 0)
-        return 1;
-    else if((*i & 0xFBF0) == 0xF240 && (*(i + 1) & 0x8000) == 0)
-        return 1;
-    else
-        return 0;
-}
-
-static int insn_mov_imm_rd(uint16_t* i)
-{
-    if((*i & 0xF800) == 0x2000)
-        return (*i >> 8) & 7;
-    else if((*i & 0xFBEF) == 0xF04F && (*(i + 1) & 0x8000) == 0)
-        return (*(i + 1) >> 8) & 0xF;
-    else if((*i & 0xFBF0) == 0xF240 && (*(i + 1) & 0x8000) == 0)
-        return (*(i + 1) >> 8) & 0xF;
-    else
-        return 0;
-}
-
-static int insn_mov_imm_imm(uint16_t* i)
-{
-    if((*i & 0xF800) == 0x2000)
-        return *i & 0xF;
-    else if((*i & 0xFBEF) == 0xF04F && (*(i + 1) & 0x8000) == 0)
-        return thumb_expand_imm_c(((*i & 0x0400) << 1) | ((*(i + 1) & 0x7000) >> 4) | (*(i + 1) & 0xFF));
-    else if((*i & 0xFBF0) == 0xF240 && (*(i + 1) & 0x8000) == 0)
-        return ((*i & 0xF) << 12) | ((*i & 0x0400) << 1) | ((*(i + 1) & 0x7000) >> 4) | (*(i + 1) & 0xFF);
-    else
-        return 0;
-}
-
-static int insn_is_movt(uint16_t* i)
-{
-    return (*i & 0xFBF0) == 0xF2C0 && (*(i + 1) & 0x8000) == 0;
-}
-
-static int insn_movt_rd(uint16_t* i)
-{
-    return (*(i + 1) >> 8) & 0xF;
-}
-
-static int insn_movt_imm(uint16_t* i)
-{
-    return ((*i & 0xF) << 12) | ((*i & 0x0400) << 1) | ((*(i + 1) & 0x7000) >> 4) | (*(i + 1) & 0xFF);
-}
-
-static int insn_is_ldr_imm(uint16_t* i)
-{
-    uint8_t opA = bit_range(*i, 15, 12);
-    uint8_t opB = bit_range(*i, 11, 9);
-    
-    return opA == 6 && (opB & 4) == 4;
-}
-
-static int insn_ldr_imm_rt(uint16_t* i)
-{
-    return (*i & 7);
-}
-
-static int insn_ldr_imm_imm(uint16_t* i)
-{
-    return (((*i >> 6) & 0x1F) << 2);
-}
-
-int insn_ldr_reg_rt(uint16_t* i)
-{
-    if((*i & 0xFE00) == 0x5800)
-        return *i & 0x7;
-    else if((*i & 0xFFF0) == 0xF850 && (*(i + 1) & 0x0FC0) == 0x0000)
-        return (*(i + 1) >> 12) & 0xF;
-    else
-        return 0;
-}
-
-int insn_ldr_reg_rm(uint16_t* i)
-{
-    if((*i & 0xFE00) == 0x5800)
-        return (*i >> 6) & 0x7;
-    else if((*i & 0xFFF0) == 0xF850 && (*(i + 1) & 0x0FC0) == 0x0000)
-        return *(i + 1) & 0xF;
-    else
-        return 0;
-}
-
-static int insn_is_bl(uint16_t* i)
-{
-    if((*i & 0xf800) == 0xf000 && (*(i + 1) & 0xd000) == 0xd000)
-        return 1;
-    else if((*i & 0xf800) == 0xf000 && (*(i + 1) & 0xd001) == 0xc000)
-        return 1;
-    else
-        return 0;
-}
-
-static uint32_t insn_bl_imm32(uint16_t* i)
-{
-    uint16_t insn0 = *i;
-    uint16_t insn1 = *(i + 1);
-    uint32_t s = (insn0 >> 10) & 1;
-    uint32_t j1 = (insn1 >> 13) & 1;
-    uint32_t j2 = (insn1 >> 11) & 1;
-    uint32_t i1 = ~(j1 ^ s) & 1;
-    uint32_t i2 = ~(j2 ^ s) & 1;
-    uint32_t imm10 = insn0 & 0x3ff;
-    uint32_t imm11 = insn1 & 0x7ff;
-    uint32_t imm32 = (imm11 << 1) | (imm10 << 12) | (i2 << 22) | (i1 << 23) | (s ? 0xff000000 : 0);
-    return imm32;
-}
-
-/* patchfinder32 - END */
 
 struct nlist *find_sym(const char *sym)
 {
@@ -229,37 +56,66 @@ struct nlist *find_sym(const char *sym)
     return NULL;
 }
 
-uint32_t find_sig(uint8_t *sig)
+uint32_t find_sig(uint8_t *sig, size_t size)
 {
     if (!mh || !sig)
         return -1;
     
-    struct segment_command *text = find_segment_command(mh, SEG_TEXT);
+    struct segment_command *text = find_segment_command32(mh, SEG_TEXT);
     if (!text)
         return -2;
     
     void *search_base = (base + text->fileoff);
-    void *p = memmem(search_base, text->filesize, sig, sizeof(sig));
+    void *p = memmem(search_base, text->filesize, sig, size);
     if (!p)
         return -3;
     
     return (uint32_t)(p - base);
 }
 
-/* offset finders */
+void *find_insn(void *start, size_t num, uint32_t insn, uint8_t direction, uint8_t mode)
+{
+    if (!start || !num || !insn)
+        return NULL;
+    
+    switch (mode) {
+        case INSN_SEARCH_MODE_THUMB: {
+            for (uint16_t *p = (uint16_t *)start;
+                 ((!direction) ? p < ((uint16_t *)start + num) : p > ((uint16_t *)start - num));
+                 ((!direction) ? p++ : p--))
+            {
+                if (*p == insn)
+                    return p;
+            }
+            break;
+        }
+        
+        case INSN_SEARCH_MODE_ARM32: {
+            for (uint32_t *p = (uint32_t *)start;
+                 ((!direction) ? p < ((uint32_t *)start + num) : p > ((uint32_t *)start - num));
+                 ((!direction) ? p++ : p--))
+            {
+                if (*p == insn)
+                    return p;
+            }
+            break;
+        }
+            
+        default:
+            break;
+    }
+    
+    return NULL;
+}
 
-#define OSSERIALIZER_SERIALIZE_SYMBOL_NAME  "__ZNK12OSSerializer9serializeEP11OSSerialize"
-#define OSSYMBOL_GETMETACLASS_SYMBOL_NAME   "__ZNK8OSSymbol12getMetaClassEv"
-#define BUFATTR_CPX_SYMBOL_NAME             "_bufattr_cpx"
-#define COPYIN_SYMBOL_NAME                  "_copyin"
-#define KERNEL_PMAP_SYMBOL_NAME             "_kernel_pmap"
+/* offset finders */
 
 uint32_t find_OSSerializer_serialize(void)
 {
     struct nlist *n = find_sym(OSSERIALIZER_SERIALIZE_SYMBOL_NAME);
     assert(n);
     
-    return n->n_value;
+    return UNSLIDE(uint32_t, n->n_value, kbase);
 }
 
 uint32_t find_OSSymbol_getMetaClass(void)
@@ -267,7 +123,7 @@ uint32_t find_OSSymbol_getMetaClass(void)
     struct nlist *n = find_sym(OSSYMBOL_GETMETACLASS_SYMBOL_NAME);
     assert(n);
     
-    return n->n_value;
+    return UNSLIDE(uint32_t, n->n_value, kbase);
 }
 
 uint32_t find_calend_gettime(void)
@@ -275,15 +131,19 @@ uint32_t find_calend_gettime(void)
     struct nlist *n = find_sym("_clock_get_calendar_nanotime");
     assert(n);
     
+    struct segment_command *text = find_segment_command32(mh, SEG_TEXT);
+    
     uint32_t xref = n->n_value;
     
-    for (uint16_t *p = (uint16_t *)(base + find_segment_command(mh, SEG_TEXT)->fileoff); p < (uint16_t *)(base + find_segment_command(mh, SEG_TEXT)->filesize); p++)
+    for (uint16_t *p = (uint16_t *)(base + text->fileoff); p < (uint16_t *)(base + text->filesize); p++)
         if (insn_is_32bit(p) && insn_is_bl(p)) {
-            uint32_t ip = (uint32_t)((void *)p - base) + kbase;
-            if ((ip + (int32_t)insn_bl_imm32(p) + 4) == xref)
-                return ip; // XXX: assuming first xref is correct one, may not be (?)
+            uint32_t ip = ADDR_MAP_TO_KCACHE(p);
+            if ((ip + (int32_t)insn_bl_imm32(p) + 4) == xref) // XXX: assuming first xref is correct one, may not be (?)
+                return UNSLIDE(uint32_t,
+                               ADDR_MAP_TO_KCACHE(find_insn(p, 10, 0xB590, INSN_SEARCH_DIRECTION_BWD, INSN_SEARCH_MODE_THUMB)),
+                               kbase);
         }
-    
+     
     return 0;
 }
 
@@ -292,7 +152,7 @@ uint32_t find_bufattr_cpx(void)
     struct nlist *n = find_sym(BUFATTR_CPX_SYMBOL_NAME);
     assert(n);
     
-    return n->n_value;
+    return UNSLIDE(uint32_t, n->n_value, kbase);
 }
 
 uint32_t find_clock_ops(void)
@@ -302,17 +162,17 @@ uint32_t find_clock_ops(void)
     
     uint32_t val = 0;
     
-    for (uint16_t *p = (uint16_t *)(base + (n->n_value - kbase)); *p != 0xBF00; p++) {
+    for (uint16_t *p = (uint16_t *)(ADDR_KCACHE_TO_MAP(n->n_value)); *p != 0xBF00; p++) {
         if (insn_is_mov_imm(p) && (!insn_mov_imm_rd(p))) {
             val = insn_mov_imm_imm(p);
         } else if (insn_is_movt(p) && (!insn_movt_rd(p))) {
             val |= (insn_movt_imm(p) << 16);
         } else if (insn_is_add_reg(p) && (!insn_add_reg_rd(p)) && (insn_add_reg_rm(p) == 0xF)) {
-            uint32_t ip = (uint32_t)((void *)(p+2) - base) + kbase;
-            uint32_t *addr = (uint32_t *)(base + ((ip + val) - kbase));
+            uint32_t ip = ADDR_MAP_TO_KCACHE(p);
+            uint32_t *addr = (uint32_t *)ADDR_KCACHE_TO_MAP(ip+val+4);
             assert(*addr);
             
-            return (*addr) + 0xC;
+            return UNSLIDE(uint32_t, ((*addr) + 0xC), kbase);
         }
     }
     
@@ -324,7 +184,7 @@ uint32_t find_copyin(void)
     struct nlist *n = find_sym(COPYIN_SYMBOL_NAME);
     assert(n);
     
-    return n->n_value;
+    return UNSLIDE(uint32_t, n->n_value, kbase);
 }
 
 uint32_t find_bx_lr(void)
@@ -337,10 +197,10 @@ uint32_t find_write_gadget(void)
     struct nlist *n = find_sym("_enable_kernel_vfp_context");
     assert(n);
     
-    uint16_t *p = NULL;
-    for (p = (uint16_t *)(base + (n->n_value - kbase)); *p != 0x100C; p--);
+    uint16_t *p = find_insn(ADDR_KCACHE_TO_MAP(n->n_value), 50, 0x100C, INSN_SEARCH_DIRECTION_BWD, INSN_SEARCH_MODE_THUMB);
+    assert(p);
     
-    return (uint32_t)((void *)p - base) + kbase;
+    return UNSLIDE(uint32_t, ADDR_MAP_TO_KCACHE(p), kbase);
 }
 
 uint32_t find_vm_kernel_addrperm(void)
@@ -356,13 +216,13 @@ uint32_t find_vm_kernel_addrperm(void)
         } else if (insn_is_movt(p) && (insn_movt_rd(p) == 2)) {
             val |= (insn_movt_imm(p) << 16);
         } else if (insn_is_add_reg(p) && (insn_add_reg_rd(p) == 2) && (insn_add_reg_rm(p) == 0xF)) {
-            uint32_t ip = (uint32_t)((void *)(p+2) - base) + kbase;
-            val += ip;
+            uint32_t ip = ADDR_MAP_TO_KCACHE(p);
+            val += ip+4;
         } else if (insn_is_ldr_imm(p) && (insn_ldr_imm_rt(p) == 2)) {
             val += insn_ldr_imm_imm(p);
             val -= 0x8;
             
-            return val;
+            return UNSLIDE(uint32_t, val, kbase);
         }
     }
     
@@ -374,7 +234,7 @@ uint32_t find_kernel_pmap(void)
     struct nlist *n = find_sym(KERNEL_PMAP_SYMBOL_NAME);
     assert(n);
     
-    return n->n_value;
+    return UNSLIDE(uint32_t, n->n_value, kbase);
 }
 
 uint32_t find_flush_dcache(void)
@@ -384,8 +244,7 @@ uint32_t find_flush_dcache(void)
         0x5E, 0x0F, 0x07, 0xEE
     };
     
-    uint32_t off = find_sig((void *)&sig);
-    return (uint32_t)(off + kbase);
+    return find_sig((void *)&sig, sizeof(sig));
 }
 
 uint32_t find_invalidate_tlb(void)
@@ -398,8 +257,7 @@ uint32_t find_invalidate_tlb(void)
         0x1E, 0xFF, 0x2F, 0xE1
     };
     
-    uint32_t off = find_sig((void *)&sig);
-    return (uint32_t)(off + kbase);
+    return find_sig((void *)&sig, sizeof(sig));
 }
 
 uint32_t find_allproc(void)
@@ -416,9 +274,9 @@ uint32_t find_allproc(void)
     boolean_t mark2 = FALSE;
     
     uint32_t *p = NULL;
-    for (p = (uint32_t *)(base + (n->n_value - kbase));; p++) {
+    for (p = (uint32_t *)(ADDR_KCACHE_TO_MAP(n->n_value));; p++) {
         if (insn_is_32bit((uint16_t *)p) && insn_is_bl((uint16_t *)p)) {
-            uint32_t ip = (uint32_t)((void *)p - base) + kbase;
+            uint32_t ip = ADDR_MAP_TO_KCACHE(p);
             uint32_t val = (ip + (int32_t)insn_bl_imm32((uint16_t *)p) + 4);
             
             if (!mark1 && (val == n2->n_value))
@@ -442,7 +300,7 @@ uint32_t find_allproc(void)
             val += insn_ldr_imm_imm(p2);
             val += 0x8;
             
-            return val;
+            return UNSLIDE(uint32_t, val, kbase);
         }
     }
     
@@ -454,7 +312,8 @@ uint32_t find_proc_ucred(void)
     struct nlist *n = find_sym("_proc_ucred");
     assert(n);
     
-    uint32_t *addr = (uint32_t *)(base + (n->n_value - kbase));
+    uint32_t *addr = (uint32_t *)(ADDR_KCACHE_TO_MAP(n->n_value));
+    assert(addr && *addr);
     
     return ((*addr) >> 16);
 }
@@ -470,8 +329,7 @@ uint32_t find_setreuid(void)
         0x4d, 0x68, 0xdf, 0xf7
     };
     
-    uint32_t off = find_sig((void *)&sig);
-    return (uint32_t)(off + kbase);
+    return find_sig((void *)&sig, sizeof(sig));
 }
 
 uint32_t find_task_for_pid(void)
@@ -484,9 +342,13 @@ uint32_t find_task_for_pid(void)
         0x00, 0x21, 0x03, 0x91
     };
     
-    uint32_t off = find_sig((void *)&sig);
-    return (uint32_t)(off + kbase);
+    return find_sig((void *)&sig, sizeof(sig));
 }
+
+#define FIND_OFFSET(name)               uint32_t off_##name = find_##name();
+#define PRINT_OFFSET(name)              fprintf(stdout, "[%-25s]: %#x\n", #name, off_##name)
+
+#define FIND_AND_PRINT_OFFSET(name)     { FIND_OFFSET(name); PRINT_OFFSET(name); }
 
 int main(int argc, const char * argv[]) {
     
@@ -495,58 +357,42 @@ int main(int argc, const char * argv[]) {
         return 1;
     }
     
+    fprintf(stdout, "(+) Opening \'%s\', found in %s\n", strrchr(argv[1], '/')+1, argv[1]);
+    
     macho_map_t *map = map_macho_with_path(argv[1], O_RDONLY);
     assert(map);
     
-    mh = (struct mach_header *)(map->map_data);
+    mh = get_mach_header32(map);
     
     if (mh->magic != MH_MAGIC) {
         printf("Error: Invalid kernelcache!\n");
         return 2;
     }
     
+    fprintf(stdout, "(+) Successfully mapped and validated kernelcache. Dumping offsets...\n\n");
+    
     base = map->map_data;
-    kbase = find_segment_command(mh, SEG_TEXT)->vmaddr;
+    kbase = find_segment_command32(mh, SEG_TEXT)->vmaddr;
     
     symtab = find_symtab_command(mh);
     assert(symtab);
     
-    uint32_t OSSerializer_serialize_off = find_OSSerializer_serialize();
-    uint32_t OSSymbol_getMetaClass_off = find_OSSymbol_getMetaClass();
-    uint32_t calend_gettime_off = find_calend_gettime();
-    uint32_t bufattr_cpx_off = find_bufattr_cpx();
-    uint32_t clock_ops_off = find_clock_ops();
-    uint32_t copyin_off = find_copyin();
-    uint32_t bx_lr_off = find_bx_lr();
-    uint32_t write_gadget_off = find_write_gadget();
-    uint32_t vm_kernel_addrperm = find_vm_kernel_addrperm();
-    uint32_t kernel_pmap_off = find_kernel_pmap();
-    uint32_t flush_dcache_off = find_flush_dcache();
-    uint32_t invalidate_tlb_off = find_invalidate_tlb();
-    uint32_t setreuid_off = find_setreuid();
-    uint32_t proc_ucred_off = find_proc_ucred();
-    uint32_t task_for_pid_off = find_task_for_pid();
-    uint32_t allproc_off = find_allproc();
-    
-    /* print offsets */
-    
-    printf("find_OSSerializer_serialize(): %#x (slid: %#x)\n",     OSSerializer_serialize_off - kbase, OSSerializer_serialize_off);
-    printf("find_OSSymbol_getMetaClass(): %#x (slid: %#x)\n",      OSSymbol_getMetaClass_off - kbase, OSSymbol_getMetaClass_off);
-    printf("find_calend_gettime(): %#x (slid: %#x)\n",             calend_gettime_off - kbase, calend_gettime_off);
-    printf("find_bufattr_cpx(): %#x (slid: %#x)\n",                bufattr_cpx_off - kbase, bufattr_cpx_off);
-    printf("find_clock_ops(): %#x (slid: %#x)\n",                  clock_ops_off - kbase, clock_ops_off);
-    printf("find_copyin(): %#x (slid: %#x)\n",                     copyin_off - kbase, copyin_off);
-    printf("find_bx_lr(): %#x (slid: %#x)\n",                      bx_lr_off - kbase, bx_lr_off);
-    printf("find_write_gadget(): %#x (slid: %#x)\n",               write_gadget_off - kbase, write_gadget_off);
-    printf("find_vm_kernel_addrperm(): %#x (slid: %#x)\n",         vm_kernel_addrperm - kbase, vm_kernel_addrperm);
-    printf("find_kernel_pmap(): %#x (slid: %#x)\n",                kernel_pmap_off - kbase, kernel_pmap_off);
-    printf("find_flush_dcache(): %#x (slid: %#x)\n",               flush_dcache_off - kbase, flush_dcache_off);
-    printf("find_invalidate_tlb(): %#x (slid: %#x)\n",             invalidate_tlb_off - kbase, invalidate_tlb_off);
-    printf("find_proc_ucred(): %#x\n",                             proc_ucred_off);
-    printf("find_setreuid(): %#x (slid: %#x)\n",                   setreuid_off - kbase, setreuid_off);
-    printf("find_task_for_pid(): %#x (slid: %#x)\n",               task_for_pid_off - kbase, task_for_pid_off);
-    printf("find_allproc(): %#x (slid: %#x)\n",                    allproc_off - kbase, allproc_off);
-    
+    FIND_AND_PRINT_OFFSET(OSSerializer_serialize);
+    FIND_AND_PRINT_OFFSET(OSSymbol_getMetaClass);
+    FIND_AND_PRINT_OFFSET(calend_gettime);
+    FIND_AND_PRINT_OFFSET(bufattr_cpx);
+    FIND_AND_PRINT_OFFSET(clock_ops);
+    FIND_AND_PRINT_OFFSET(copyin);
+    FIND_AND_PRINT_OFFSET(bx_lr);
+    FIND_AND_PRINT_OFFSET(write_gadget);
+    FIND_AND_PRINT_OFFSET(vm_kernel_addrperm);
+    FIND_AND_PRINT_OFFSET(kernel_pmap);
+    FIND_AND_PRINT_OFFSET(flush_dcache);
+    FIND_AND_PRINT_OFFSET(invalidate_tlb);
+    FIND_AND_PRINT_OFFSET(setreuid);
+    FIND_AND_PRINT_OFFSET(proc_ucred);
+    FIND_AND_PRINT_OFFSET(task_for_pid);
+    FIND_AND_PRINT_OFFSET(allproc);
     
     return 0;
 }
