@@ -205,22 +205,27 @@ uint32_t find_write_gadget(void)
 
 uint32_t find_vm_kernel_addrperm(void)
 {
-    struct nlist *n = find_sym("_vm_kernel_addrperm_external");
+    struct nlist *n = find_sym("_buf_kernel_addrperm_addr");
     assert(n);
     
     uint32_t val = 0;
     
-    for (uint16_t *p = (uint16_t *)(base + (n->n_value - kbase)); *p != 0xBF00; p++) {
-        if (insn_is_mov_imm(p) && (insn_mov_imm_rd(p) == 2)) {
+    // 0x4700 is bx lr, this proc ends with it
+    for (uint16_t *p = (uint16_t *)(base + (n->n_value - kbase)); *p != 0x4700; p++) {
+        if (insn_is_mov_imm(p) && (insn_mov_imm_rd(p) == 1)) {
+            // movw r1, #X
             val = insn_mov_imm_imm(p);
-        } else if (insn_is_movt(p) && (insn_movt_rd(p) == 2)) {
+        } else if (insn_is_movt(p) && (insn_movt_rd(p) == 1)) {
+            // movt r1, #X
             val |= (insn_movt_imm(p) << 16);
-        } else if (insn_is_add_reg(p) && (insn_add_reg_rd(p) == 2) && (insn_add_reg_rm(p) == 0xF)) {
+        } else if (insn_is_add_reg(p) && (insn_add_reg_rd(p) == 1) && (insn_add_reg_rm(p) == 0xF)) {
+            // add r1, pc
             uint32_t ip = ADDR_MAP_TO_KCACHE(p);
             val += ip+4;
-        } else if (insn_is_ldr_imm(p) && (insn_ldr_imm_rt(p) == 2)) {
+        } else if (insn_is_ldr_imm(p) && (insn_ldr_imm_rt(p) == 1)) {
+            // ldr r1, [r0, #XX]
             val += insn_ldr_imm_imm(p);
-            val -= 0x8;
+            val -= 0x4;
             
             return UNSLIDE(uint32_t, val, kbase);
         }
